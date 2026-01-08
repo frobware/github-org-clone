@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+
+# dop - Dispatch Operations in Parallel.
+# Copyright (c) 2026 Andrew McDermott. MIT License.
+
+set -eu
+set -o pipefail
+
+show_help() {
+    cat << EOF
+# dop - Dispatch Operations in Parallel
+
+dop is a command-line utility for executing multiple operations in
+parallel using GNU parallel with simplified output handling and error
+reporting.
+
+## Usage
+
+    some-command | dop [-j <num-jobs>] [parallel-options]
+
+## Parameters:
+
+    -h, --help              Display this help message and exit
+    -j, --jobs <num-jobs>   Number of jobs to run simultaneously (default: number of CPU cores)
+    [parallel-options]      Any additional options passed directly to GNU parallel
+
+## Examples:
+
+    # Process all log files with 4 parallel jobs.
+    find /var/log -name "*.log" | dop -j 4 'gzip {}'
+
+    # Run multiple curl commands in parallel (default to number of cores).
+    cat urls.txt | dop 'curl -s {} > {/.}.html'
+
+    # Use parallel options with dop.
+    find . -name "*.jpg" | dop -j ${P:-8} --timeout 30 'convert {} {.}.png'
+
+## Output
+
+    - Progress bar showing completed/pending tasks
+    - Estimated time of completion
+    - On failure: summary of failed tasks with exit codes and log file locations
+    - Logs are kept in a temp directory on failure, cleaned up on success
+
+## Error Handling
+
+    By default, dop will run all commands even if some fail (using
+    --halt never). Failed commands are reported at the end with their
+    exit codes and log file locations.
+EOF
+}
+
+job_num=0
+jobfile=$(mktemp)
+logdir=$(mktemp -d --tmpdir dop-logs.XXXXXX)
+joblog="$logdir/joblog.txt"
+jobs=
+parallel_args=()
+
+# Clean up temporary files on exit.
+# shellcheck disable=SC2329  # Invoked via trap.
+cleanup() {
+    rm -f "$jobfile"
+    # Keep logdir on failure for debugging.
+    if [[ "${dop_success:-false}" = true ]]; then
+        rm -rf "$logdir"
+    fi
+}
+trap cleanup EXIT
+
+# Parse command-line arguments.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -j|--jobs)
+            jobs="$2"
+            shift 2
+            ;;
+        *)
+            parallel_args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$jobs" ]]; then
+    jobs="$(nproc)"
+fi
+
+if [[ -t 0 ]]; then
+    show_help
+    exit 1
+fi
+
+while IFS= read -r command; do
+    job_num=$((job_num + 1))
+    log_file="$logdir/dop-log-${job_num}.txt"
+    echo "$command > \"$log_file\" 2>&1" >> "$jobfile"
+done
+
+# If no extra parallel arguments were provided, default to --halt never.
+if [[ ${#parallel_args[@]} -eq 0 ]]; then
+    parallel_args+=(--halt never)
+fi
+
+parallel_opts=(--joblog "$joblog" -j "$jobs")
+if [[ -t 1 ]]; then
+    parallel_opts+=(--bar --eta)
+fi
+
+if parallel "${parallel_opts[@]}" "${parallel_args[@]}" < "$jobfile"; then
+    dop_success=true
+    exit 0
+fi
+
+# Extract column number by name from GNU parallel joblog.
+get_column_number() {
+    local column_name="$1"
+    awk -v col="$column_name" '
+        NR==1 {
+            for (i=1; i<=NF; i++) {
+                if ($i == col) {
+                    print i
+                    exit
+                }
+            }
+        }
+    ' "$joblog"
+}
+
+exitval_col=$(get_column_number "Exitval")
+command_col=$(get_column_number "Command")
+
+if [[ -z "$exitval_col" || -z "$command_col" ]]; then
+    echo "ERROR: Could not determine Exitval or Command column in job log." >&2
+    exit 1
+fi
+
+failed_tasks=$(awk -v exitcol="$exitval_col" -v cmdcol="$command_col" '
+    NR > 1 && $exitcol != 0 {
+        cmd = $cmdcol
+        for (i = cmdcol + 1; i <= NF; i++) {
+            cmd = cmd " " $i
+        }
+        print $1, $exitcol, cmd
+    }
+' "$joblog")
+
+if [[ -n "$failed_tasks" ]]; then
+    echo "Some tasks failed:" >&2
+    echo "$failed_tasks" | while read -r task_id exit_code command; do
+        echo "  - Task #$task_id failed with exit code $exit_code" >&2
+        echo "    ├── Command: $command" >&2
+        echo "    └── Log: $logdir/dop-log-$task_id.txt" >&2
+    done
+fi
+
+exit 2  # Exit with code 2 to distinguish from usage errors (1).
