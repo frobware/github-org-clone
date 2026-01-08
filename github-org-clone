@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+
+set -eu
+set -o pipefail
+
+# Outputs git commands to clone/fetch repositories from a GitHub
+# organisation. Pipe to sh, parallel, or dop to execute.
+
+VERSION="0.1.0"
+
+shallow=false
+basedir="${CLONE_BASEDIR:-$HOME/src}"
+org=""
+source_only=false
+forks_only=false
+skip_archived=false
+visibility="public"
+specific_repos=()
+list_repos=false
+json_output=false
+
+usage() {
+    echo "Usage: ${0##*/} [OPTIONS] <org> [repo...]"
+    echo
+    echo "Output git commands to clone/fetch repositories from a GitHub organisation."
+    echo "Pipe output to sh, parallel, or dop to execute."
+    echo
+    echo "Clones to: <basedir>/github.com/<org>/<repo> (default: ~/src/github.com/...)"
+    echo
+    echo "Examples:"
+    echo "  ${0##*/} openshift | sh"
+    echo "  ${0##*/} openshift | parallel -j 8 --bar --eta"
+    echo "  ${0##*/} openshift | dop -j 8"
+    echo
+    echo "Filtering:"
+    echo "  -s, --source        Only non-forked repositories (default)"
+    echo "  -f, --forks         Only forked repositories"
+    echo "  -a, --no-archived   Skip archived repositories"
+    echo "  --private           Also include private repositories (default: public only)"
+    echo
+    echo "Listing:"
+    echo "  -l, --list          List repositories and exit"
+    echo "  --json              Output in JSON format (with --list)"
+    echo
+    echo "Options:"
+    echo "  -b, --basedir DIR   Base directory for clones (default: ~/src, or CLONE_BASEDIR)"
+    echo "  --shallow           Use shallow clones (--depth 1)"
+    echo
+    echo "  -h, --help          Show this help message"
+    echo "  -v, --version       Show version"
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -b|--basedir)
+            basedir="$2"
+            shift 2
+            ;;
+        -l|--list)
+            list_repos=true
+            shift
+            ;;
+        --json)
+            json_output=true
+            shift
+            ;;
+        -s|--source)
+            source_only=true
+            shift
+            ;;
+        -f|--forks)
+            forks_only=true
+            shift
+            ;;
+        -a|--no-archived)
+            skip_archived=true
+            shift
+            ;;
+        --private)
+            visibility=""
+            shift
+            ;;
+        --shallow)
+            shallow=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -v|--version)
+            echo "$VERSION"
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            if [ -z "$org" ]; then
+                org="$1"
+            else
+                specific_repos+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$org" ]; then
+    echo "Error: organisation required" >&2
+    echo "Usage: ${0##*/} [OPTIONS] <org>" >&2
+    exit 1
+fi
+
+# Convert basedir to absolute path (works even if it doesn't exist yet).
+basedir=$(realpath -m "$basedir")
+base_dir="$basedir/github.com/$org"
+
+# Handle --list mode.
+if [ "$list_repos" = true ]; then
+    gh_fields="nameWithOwner,isFork,isArchived,description,parent"
+
+    if [ ${#specific_repos[@]} -gt 0 ]; then
+        # List specific repos; collect into JSON array.
+        json_data="["
+        first=true
+        for repo in "${specific_repos[@]}"; do
+            $first || json_data+=","
+            first=false
+            json_data+=$(gh repo view "$org/$repo" --json "$gh_fields")
+        done
+        json_data+="]"
+    else
+        # List all repos from org.
+        gh_args=(--limit 5000 --json "$gh_fields")
+        [ "$source_only" = true ] && gh_args+=(--source)
+        [ "$forks_only" = true ] && gh_args+=(--fork)
+        [ "$skip_archived" = true ] && gh_args+=(--no-archived)
+        [ -n "$visibility" ] && gh_args+=(--visibility "$visibility")
+
+        json_data=$(gh repo list "$org" "${gh_args[@]}")
+    fi
+
+    if [ "$json_output" = true ]; then
+        echo "$json_data" | jq .
+    else
+        echo "$json_data" | jq -r --arg org "$org" '.[] | [(.nameWithOwner | sub("^\($org)/"; "")), (if .parent then "\(.parent.owner.login)/\(.parent.name)" else "-" end), (if .isArchived then "archived" else "-" end)] | @tsv' | column -t -s $'\t'
+    fi
+    exit 0
+fi
+
+# Default to source-only; forks are opt-in.
+if [ "$forks_only" = false ]; then
+    source_only=true
+fi
+
+if [ ${#specific_repos[@]} -gt 0 ]; then
+    # Use specified repos.
+    repos=""
+    for repo in "${specific_repos[@]}"; do
+        repos+="$org/$repo"$'\n'
+    done
+    repos="${repos%$'\n'}"  # Remove trailing newline.
+else
+    # Fetch all repos from org.
+    gh_args=(--limit 5000 --json "nameWithOwner,isEmpty" --jq '.[] | select(.isEmpty == false) | .nameWithOwner')
+    [ "$source_only" = true ] && gh_args+=(--source)
+    [ "$forks_only" = true ] && gh_args+=(--fork)
+    [ "$skip_archived" = true ] && gh_args+=(--no-archived)
+    [ -n "$visibility" ] && gh_args+=(--visibility "$visibility")
+
+    repos=$(gh repo list "$org" "${gh_args[@]}")
+fi
+
+# Build clone args.
+clone_args="--quiet "
+[ "$shallow" = true ] && clone_args+="--depth 1 "
+
+# Output git commands.
+echo "$repos" | while read -r repo; do
+    repo_name="${repo#*/}"
+    repo_dir="$base_dir/$repo_name"
+    url="https://github.com/$repo.git"
+
+    if [ -d "$repo_dir/.git" ]; then
+        echo "git -C \"$repo_dir\" fetch --quiet \"$url\""
+    else
+        echo "mkdir -p \"$base_dir\" && git clone ${clone_args}\"$url\" \"$repo_dir\""
+    fi
+done
