@@ -178,14 +178,24 @@ fi
 clone_args="--quiet "
 [ "$shallow" = true ] && clone_args+="--depth 1 "
 
+# The ceiling stops repository discovery ascending past $base_dir.
+is_repo() {
+    GIT_CEILING_DIRECTORIES="$base_dir" \
+        git -C "$1" rev-parse --git-dir >/dev/null 2>&1
+}
+
 # Output git commands.
 echo "$repos" | while read -r repo; do
     repo_name="${repo#*/}"
     repo_dir="$base_dir/$repo_name"
     url="https://github.com/$repo.git"
 
-    if [ -d "$repo_dir/.git" ]; then
+    if is_repo "$repo_dir"; then
         echo "git -C \"$repo_dir\" fetch --quiet \"$url\""
+    elif is_repo "$repo_dir.git"; then
+        echo "git -C \"$repo_dir.git\" fetch --quiet \"$url\""
+    elif [ -e "$repo_dir" ]; then
+        echo "$PROGNAME: $repo_dir is not a repository, skipping" >&2
     else
         echo "mkdir -p \"$base_dir\" && git clone ${clone_args}\"$url\" \"$repo_dir\""
     fi
