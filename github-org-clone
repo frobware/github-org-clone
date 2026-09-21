@@ -7,6 +7,7 @@ set -o pipefail
 # organisation. Pipe to sh, parallel, or dop to execute.
 
 VERSION="0.1.0"
+PROGNAME="github-org-clone"
 
 shallow=false
 basedir="${CLONE_BASEDIR:-$HOME/src}"
@@ -20,7 +21,7 @@ list_repos=false
 json_output=false
 
 usage() {
-    echo "Usage: ${0##*/} [OPTIONS] <org> [repo...]"
+    echo "Usage: $PROGNAME [OPTIONS] <org> [repo...]"
     echo
     echo "Output git commands to clone/fetch repositories from a GitHub organisation."
     echo "Pipe output to sh, parallel, or dop to execute."
@@ -28,9 +29,9 @@ usage() {
     echo "Clones to: <basedir>/github.com/<org>/<repo> (default: ~/src/github.com/...)"
     echo
     echo "Examples:"
-    echo "  ${0##*/} openshift | sh"
-    echo "  ${0##*/} openshift | parallel -j 8 --bar --eta"
-    echo "  ${0##*/} openshift | dop -j 8"
+    echo "  $PROGNAME openshift | sh"
+    echo "  $PROGNAME openshift | parallel -j 8 --bar --eta"
+    echo "  $PROGNAME openshift | dop -j 8"
     echo
     echo "Filtering:"
     echo "  -s, --source        Only non-forked repositories (default)"
@@ -109,7 +110,7 @@ done
 
 if [ -z "$org" ]; then
     echo "Error: organisation required" >&2
-    echo "Usage: ${0##*/} [OPTIONS] <org>" >&2
+    echo "Usage: $PROGNAME [OPTIONS] <org>" >&2
     exit 1
 fi
 
